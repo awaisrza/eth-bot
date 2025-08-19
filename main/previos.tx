@@ -1,0 +1,81 @@
+#!/usr/bin/env node
+const { ethers } = require("ethers");
+const fs = require("fs");
+const dotenv = require("dotenv");
+
+dotenv.config({ path: __dirname + "/.env" });
+
+if (!process.env.RPC_URL) {
+  console.error("❌ Missing RPC_URL in .env");
+  process.exit(1);
+}
+
+const args = process.argv.slice(2);
+if (args.length < 4) {
+  console.log("Usage: node mint.js <contractAddress> <mintPriceETH> <calldata> <mintCount>");
+  process.exit(1);
+}
+
+const [CONTRACT_ADDRESS, MINT_PRICE, CALLDATA, MINT_COUNT_STR] = args;
+const MINT_COUNT = parseInt(MINT_COUNT_STR);
+
+if (isNaN(MINT_COUNT) || MINT_COUNT <= 0) {
+  console.error("❌ Invalid mint count, must be a number > 0");
+  process.exit(1);
+}
+
+const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+
+// 🔑 Load wallets
+const wallets = fs
+  .readFileSync("wallets.txt", "utf-8")
+  .split("\n")
+  .map(w => w.trim())
+  .filter(Boolean);
+
+if (wallets.length === 0) {
+  console.error("❌ No wallets found in wallets.txt");
+  process.exit(1);
+}
+
+async function mintWithWallet(pk) {
+  const wallet = new ethers.Wallet(pk, provider);
+  const valueWei = ethers.parseEther(MINT_PRICE);
+
+  // ⛽ auto-get network gas price
+  const feeData = await provider.getFeeData();
+  const maxFeePerGas = feeData.maxFeePerGas || ethers.parseUnits("50", "gwei");
+  const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas || ethers.parseUnits("2", "gwei");
+
+  // send all mints in parallel
+  const txs = Array.from({ length: MINT_COUNT }).map(async (_, i) => {
+    try {
+      const tx = await wallet.sendTransaction({
+        to: CONTRACT_ADDRESS,
+        data: CALLDATA,
+        value: valueWei,
+        gasLimit: 300000n, // set safe static limit to avoid lag from estimating
+        maxFeePerGas,
+        maxPriorityFeePerGas,
+      });
+
+      console.log(`🚀 Wallet ${wallet.address} [Mint #${i + 1}] -> Tx: ${tx.hash}`);
+    } catch (err) {
+      console.error(`❌ Wallet ${wallet.address} [Mint #${i + 1}] error: ${err.message}`);
+    }
+  });
+
+  // wait until all mints broadcasted (not confirmed)
+  await Promise.all(txs);
+}
+
+async function main() {
+  console.log(`🔥 Starting fast mint: ${MINT_COUNT} per wallet (${wallets.length} wallets)`);
+
+  // run all wallets in parallel
+  await Promise.all(wallets.map(pk => mintWithWallet(pk)));
+
+  console.log("🎉 All transactions broadcasted instantly!");
+}
+
+main();
