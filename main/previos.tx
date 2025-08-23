@@ -5,77 +5,115 @@ const dotenv = require("dotenv");
 
 dotenv.config({ path: __dirname + "/.env" });
 
-if (!process.env.RPC_URL) {
-  console.error("❌ Missing RPC_URL in .env");
+// ✅ Load RPCs
+if (!process.env.RPC_URLS) {
+  console.error("❌ Missing RPC_URLS in .env (comma separated)");
   process.exit(1);
 }
-
-const args = process.argv.slice(2);
-if (args.length < 4) {
-  console.log("Usage: node mint.js <contractAddress> <mintPriceETH> <calldata> <mintCount>");
+const RPC_URLS = process.env.RPC_URLS.split(",").map(u => u.trim()).filter(Boolean);
+if (RPC_URLS.length === 0) {
+  console.error("❌ No valid RPC URLs provided");
   process.exit(1);
 }
+const providers = RPC_URLS.map(url => new ethers.JsonRpcProvider(url));
 
-const [CONTRACT_ADDRESS, MINT_PRICE, CALLDATA, MINT_COUNT_STR] = args;
-const MINT_COUNT = parseInt(MINT_COUNT_STR);
+// ✅ Load config
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
+const MINT_PRICE = process.env.MINT_PRICE;
+const CALLDATA = process.env.CALLDATA;
+const GAS_LIMIT = BigInt(process.env.GAS_LIMIT || "300000");
+const PRIORITY_GWEI = process.env.PRIORITY_GWEI || "10";
+const BASEFEE_MULT = parseFloat(process.env.BASEFEE_MULT || "2");
+const PURE_SPAM = process.env.PURE_SPAM === "true"; // always fire & forget
 
-if (isNaN(MINT_COUNT) || MINT_COUNT <= 0) {
-  console.error("❌ Invalid mint count, must be a number > 0");
+if (!CONTRACT_ADDRESS || !MINT_PRICE || !CALLDATA) {
+  console.log("❌ CONTRACT_ADDRESS, MINT_PRICE, CALLDATA required in .env");
   process.exit(1);
 }
-
-const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 
 // 🔑 Load wallets
-const wallets = fs
-  .readFileSync("wallets.txt", "utf-8")
+const wallets = fs.readFileSync("wallets.txt", "utf-8")
   .split("\n")
-  .map(w => w.trim())
-  .filter(Boolean);
+  .map(l => l.trim())
+  .filter(Boolean)
+  .map(line => {
+    const [pk, count] = line.split(",");
+    return { pk, count: parseInt(count || "1", 10) };
+  });
 
 if (wallets.length === 0) {
   console.error("❌ No wallets found in wallets.txt");
   process.exit(1);
 }
 
-async function mintWithWallet(pk) {
-  const wallet = new ethers.Wallet(pk, provider);
-  const valueWei = ethers.parseEther(MINT_PRICE);
+// ⚡ Send raw signed tx to ALL RPCs (parallel broadcast)
+async function broadcastToAllRPCs(rawTx) {
+  const results = await Promise.allSettled(
+    providers.map(async (p, i) => {
+      try {
+        const hash = await p.send("eth_sendRawTransaction", [rawTx]);
+        return `RPC${i} ✅ ${hash}`;
+      } catch (err) {
+        return `RPC${i} ❌ ${err.message}`;
+      }
+    })
+  );
+  results.forEach(r => console.log(r.value));
+}
 
-  // ⛽ auto-get network gas price
-  const feeData = await provider.getFeeData();
-  const maxFeePerGas = feeData.maxFeePerGas || ethers.parseUnits("50", "gwei");
-  const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas || ethers.parseUnits("2", "gwei");
-
-  // send all mints in parallel
-  const txs = Array.from({ length: MINT_COUNT }).map(async (_, i) => {
+// 🚀 Mint spammer
+async function mintWithWallet({ pk, count }) {
+  const wallet = new ethers.Wallet(pk);
+  for (let i = 0; i < count; i++) {
     try {
-      const tx = await wallet.sendTransaction({
+      // Pick a provider just to fetch fees + nonce
+      const provider = providers[Math.floor(Math.random() * providers.length)];
+      const connected = wallet.connect(provider);
+
+      const block = await provider.getBlock("latest");
+      const base = block.baseFeePerGas || ethers.parseUnits("30", "gwei");
+      const priority = ethers.parseUnits(PRIORITY_GWEI, "gwei");
+      const maxFee = BigInt(Math.floor(Number(base) * BASEFEE_MULT)) + BigInt(priority.toString());
+      const nonce = await provider.getTransactionCount(wallet.address, "pending");
+      const network = await provider.getNetwork(); // ✅ ensure correct chainId
+
+      const tx = {
         to: CONTRACT_ADDRESS,
         data: CALLDATA,
-        value: valueWei,
-        gasLimit: 300000n, // set safe static limit to avoid lag from estimating
-        maxFeePerGas,
-        maxPriorityFeePerGas,
-      });
+        value: ethers.parseEther(MINT_PRICE),
+        gasLimit: GAS_LIMIT,
+        maxFeePerGas: maxFee,
+        maxPriorityFeePerGas: priority,
+        nonce,
+        chainId: Number(network.chainId) // 🔥 FIX: proper EIP-155 signing
+      };
 
-      console.log(`🚀 Wallet ${wallet.address} [Mint #${i + 1}] -> Tx: ${tx.hash}`);
+      const signedTx = await wallet.signTransaction(tx);
+
+      console.log(`📤 ${wallet.address} -> Broadcast attempt ${i + 1}`);
+      await broadcastToAllRPCs(signedTx);
+
+      if (!PURE_SPAM) {
+        // If not pure spam, at least wait for one confirmation on a random RPC
+        const sent = await provider.send("eth_sendRawTransaction", [signedTx]);
+        console.log(`✅ ${wallet.address} confirmed hash: ${sent}`);
+      }
     } catch (err) {
-      console.error(`❌ Wallet ${wallet.address} [Mint #${i + 1}] error: ${err.message}`);
+      console.error(`⚠️ ${wallet.address} mint attempt failed: ${err.message}`);
     }
-  });
-
-  // wait until all mints broadcasted (not confirmed)
-  await Promise.all(txs);
+  }
 }
 
 async function main() {
-  console.log(`🔥 Starting fast mint: ${MINT_COUNT} per wallet (${wallets.length} wallets)`);
+  console.log(`🔥 Starting spam mint from ${wallets.length} wallets across ${RPC_URLS.length} HTTP RPCs...`);
+  // Debug RPC chainIds
+  for (let i = 0; i < providers.length; i++) {
+    const net = await providers[i].getNetwork();
+    console.log(`RPC${i} chainId = ${net.chainId}`);
+  }
 
-  // run all wallets in parallel
-  await Promise.all(wallets.map(pk => mintWithWallet(pk)));
-
-  console.log("🎉 All transactions broadcasted instantly!");
+  await Promise.all(wallets.map(w => mintWithWallet(w)));
+  console.log("🎉 Done sending txns");
 }
 
 main();
